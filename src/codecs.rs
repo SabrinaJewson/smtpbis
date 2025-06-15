@@ -1,11 +1,11 @@
+use crate::Reply;
+use bytes::BytesMut;
 use std::convert::TryInto;
 use std::error::Error;
-use std::fmt::{Display, Write};
-
-use bytes::BytesMut;
-use tokio_util::codec::{Decoder, Encoder};
-
-use crate::Reply;
+use std::fmt::Display;
+use std::fmt::Write;
+use tokio_util::codec::Decoder;
+use tokio_util::codec::Encoder;
 
 const DEFAULT_LINE_LENGTH: usize = 2048;
 const DEFAULT_MAX_CHUNK_SIZE: u64 = 1024 * 1024;
@@ -23,7 +23,7 @@ pub struct LineCodec {
 #[derive(Debug)]
 pub enum LineError {
     LineTooLong,
-    IO(std::io::Error),
+    Io(std::io::Error),
     ChunkingDone,
     DataAbort,
 }
@@ -49,7 +49,7 @@ impl LineCodec {
         buf: &mut BytesMut,
         next_index: usize,
     ) -> Result<Option<BytesMut>, LineError> {
-        let read_to = std::cmp::min(self.max_length.saturating_add(1), buf.len());
+        let read_to = Ord::min(self.max_length.saturating_add(1), buf.len());
 
         let crlf_offset = buf[next_index..read_to]
             .windows(2)
@@ -87,11 +87,11 @@ impl LineCodec {
         }
 
         // FIXME: too many conversions to be clear.
-        let wanted_chunk: u64 = std::cmp::min(self.max_chunk_size, bytes_remaining);
+        let wanted_chunk: u64 = Ord::min(self.max_chunk_size, bytes_remaining);
         let buf_len: u64 = buf.len().try_into().unwrap();
 
         if buf_len >= wanted_chunk {
-            let chunk_size: usize = wanted_chunk.try_into().unwrap_or(std::usize::MAX);
+            let chunk_size: usize = wanted_chunk.try_into().unwrap_or(usize::MAX);
             let chunk_size_u64: u64 = chunk_size.try_into().unwrap();
 
             self.state = State::Chunk(bytes_remaining - chunk_size_u64);
@@ -135,14 +135,14 @@ impl Encoder<Reply> for LineCodec {
     type Error = LineError;
 
     fn encode(&mut self, reply: Reply, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        write!(buf, "{}", reply)
-            .map_err(|_| LineError::from(std::io::Error::from(std::io::ErrorKind::Other)))
+        write!(buf, "{}", reply).unwrap();
+        Ok(())
     }
 }
 
 impl From<std::io::Error> for LineError {
     fn from(err: std::io::Error) -> Self {
-        Self::IO(err)
+        Self::Io(err)
     }
 }
 

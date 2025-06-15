@@ -11,13 +11,9 @@ homepage = "https://github.com/zerospam/smtpbis"
 repository = "https://github.com/zerospam/smtpbis.git"
 
 [dependencies]
-rustyknife = {version="0.2", features=["quoted-string-rfc2047"]}
-tokio = {version="1.0", features=["signal", "io-util", "sync", "net", "rt-multi-thread"]}
-tokio-util = {version="0.7", features=["codec"]}
-bytes = "1.0"
-futures = "0.3"
-futures-util = "0.3"
-tokio-rustls = "0.24"
-async-trait = "0.1.10"
-rustls-pemfile = "1.0.3"
-anyhow = "1.0.75"
+rustyknife = {git = "https://github.com/SabrinaJewson/rustyknife", rev = "9b4cad5181dbe1f4aab5a12b5e1cf705dc264c83", features=["quoted-string-rfc2047"]}
+tokio = {version="1.45.1", features=["io-util"]}
+tokio-util = {version="0.7.15", features=["codec"]}
+bytes = "1.10.1"
+futures-util = { version = "0.3.31", features = ["sink"] }
+async-trait = "0.1.88"

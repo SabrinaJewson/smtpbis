@@ -1,30 +1,40 @@
+use crate::command;
+use crate::reply::ReplyDefault;
+use crate::Command;
+use crate::Command::Base;
+use crate::Command::*;
+use crate::LineCodec;
+use crate::LineError;
+use crate::Reply;
+use async_trait::async_trait;
+use bytes::Buf;
+use bytes::BytesMut;
+use futures_util::future::select;
+use futures_util::future::Either;
+use futures_util::future::FusedFuture;
+use futures_util::sink::SinkExt;
+use futures_util::stream::Stream;
+use futures_util::stream::StreamExt;
+use futures_util::Sink;
+use rustyknife::behaviour::Intl;
+use rustyknife::behaviour::Legacy;
+use rustyknife::rfc5321::Command::*;
+use rustyknife::rfc5321::ForwardPath;
+use rustyknife::rfc5321::Param;
+use rustyknife::rfc5321::ReversePath;
+use rustyknife::types::Domain;
+use rustyknife::types::DomainPart;
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
-use async_trait::async_trait;
-use bytes::{Buf, BytesMut};
-
-use futures::future::ready;
-use futures::Sink;
-use futures_util::future::{select, Either, FusedFuture};
-use futures_util::sink::SinkExt;
-use futures_util::stream::{Stream, StreamExt};
-
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::{Framed, FramedParts};
-
-use crate::reply::ReplyDefault;
-use crate::{command, Command, Command::Base, Command::*};
-use crate::{LineCodec, LineError, Reply};
-
-use rustyknife::behaviour::{Intl, Legacy};
-use rustyknife::rfc5321::Command::*;
-use rustyknife::rfc5321::{ForwardPath, Param, ReversePath};
-use rustyknife::types::{Domain, DomainPart};
+use std::future::ready;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
+use tokio_util::codec::Framed;
+use tokio_util::codec::FramedParts;
 
 pub type EhloKeywords = BTreeMap<String, Option<String>>;
 pub type ShutdownSignal = dyn FusedFuture<Output = Result<(), ()>> + Send + Unpin;
@@ -106,7 +116,7 @@ where
 
     let res = server.serve(socket, banner).await;
     socket.flush().await?;
-    Ok(res?)
+    res
 }
 
 pub enum LoopExit<H: Handler> {
@@ -117,10 +127,10 @@ pub enum LoopExit<H: Handler> {
 #[derive(Debug, PartialEq)]
 enum State {
     Initial,
-    MAIL,
-    RCPT,
-    BDAT,
-    BDATFAIL,
+    Mail,
+    Rcpt,
+    Bdat,
+    Bdatfail,
 }
 
 struct InnerServer<'a, H> {
@@ -189,7 +199,7 @@ where
 
     fn shutdown_check(&self) -> Result<(), ServerError> {
         match (self.shutdown_on_idle, &self.state) {
-            (true, State::Initial) | (true, State::BDATFAIL) => Err(ServerError::Shutdown),
+            (true, State::Initial) | (true, State::Bdatfail) => Err(ServerError::Shutdown),
             _ => Ok(()),
         }
     }
@@ -263,14 +273,14 @@ where
                 self.handler.rset().await;
                 socket.send(Reply::ok()).await?;
             }
-            Ext(crate::Ext::STARTTLS) if self.config.enable_starttls => {
+            Ext(crate::Ext::StartTls) if self.config.enable_starttls => {
                 if let Some(tls_config) = self.handler.tls_request().await {
                     return Ok(Some(LoopExit::STARTTLS(tls_config)));
                 } else {
                     socket.send(Reply::not_implemented()).await?;
                 }
             }
-            Ext(crate::Ext::BDAT(size, last)) if self.config.enable_chunking => {
+            Ext(crate::Ext::Bdat(size, last)) if self.config.enable_chunking => {
                 let reply = self.do_bdat(socket, size, last).await?;
                 socket.send(reply).await?;
             }
@@ -345,7 +355,7 @@ where
                 .with_default(Reply::ok())
             {
                 Ok(reply) => {
-                    self.state = State::MAIL;
+                    self.state = State::Mail;
                     reply
                 }
                 Err(reply) => reply,
@@ -360,14 +370,14 @@ where
         params: Vec<Param>,
     ) -> Result<Reply, ServerError> {
         Ok(match self.state {
-            State::MAIL | State::RCPT => match self
+            State::Mail | State::Rcpt => match self
                 .handler
                 .rcpt(path, params)
                 .await
                 .with_default(Reply::ok())
             {
                 Ok(reply) => {
-                    self.state = State::RCPT;
+                    self.state = State::Rcpt;
                     reply
                 }
                 Err(reply) => reply,
@@ -383,7 +393,7 @@ where
         ServerError: From<<S as Sink<Reply>>::Error>,
     {
         Ok(match self.state {
-            State::RCPT => match self
+            State::Rcpt => match self
                 .handler
                 .data_start()
                 .await
@@ -417,8 +427,8 @@ where
                 Err(reply) => reply,
             },
             State::Initial => Reply::no_mail_transaction(),
-            State::MAIL => Reply::no_valid_recipients(),
-            State::BDAT | State::BDATFAIL => {
+            State::Mail => Reply::no_valid_recipients(),
+            State::Bdat | State::Bdatfail => {
                 Reply::new(503, None, "BDAT may not be mixed with DATA")
             }
         })
@@ -437,7 +447,7 @@ where
             + Unpin,
     {
         Ok(match self.state {
-            State::RCPT | State::BDAT => {
+            State::Rcpt | State::Bdat => {
                 let mut body_stream = read_body_bdat(socket, chunk_size).fuse();
 
                 let reply = self
@@ -464,17 +474,17 @@ where
                         if last {
                             self.state = State::Initial
                         } else {
-                            self.state = State::BDAT
+                            self.state = State::Bdat
                         }
                         reply
                     }
                     Err(reply) => {
-                        self.state = State::BDATFAIL;
+                        self.state = State::Bdatfail;
                         reply
                     }
                 }
             }
-            State::MAIL => Reply::no_valid_recipients(),
+            State::Mail => Reply::no_valid_recipients(),
             _ => Reply::no_mail_transaction(),
         })
     }
@@ -494,7 +504,7 @@ pub enum ServerError {
 impl From<LineError> for ServerError {
     fn from(source: LineError) -> Self {
         match source {
-            LineError::IO(e) => Self::IO(e),
+            LineError::Io(e) => Self::IO(e),
             _ => Self::Framing(source),
         }
     }
@@ -513,7 +523,7 @@ where
     let gen_abort = Arc::new(AtomicBool::new(true));
     let gen_abort2 = gen_abort.clone();
 
-    let abort = futures::stream::once(ready(Err(LineError::DataAbort)))
+    let abort = futures_util::stream::once(ready(Err(LineError::DataAbort)))
         .filter(move |_| ready(gen_abort.load(Ordering::SeqCst)));
 
     source
@@ -552,7 +562,7 @@ where
     let gen_abort = Arc::new(AtomicBool::new(true));
     let gen_abort2 = gen_abort.clone();
 
-    let abort = futures::stream::once(ready(Err(LineError::DataAbort)))
+    let abort = futures_util::stream::once(ready(Err(LineError::DataAbort)))
         .filter(move |_| ready(gen_abort.load(Ordering::SeqCst)));
 
     socket.codec_mut().chunking_mode(size);
