@@ -10,7 +10,6 @@ use bytes::Buf;
 use bytes::BytesMut;
 use futures_util::Sink;
 use futures_util::future::Either;
-use futures_util::future::FusedFuture;
 use futures_util::future::select;
 use futures_util::sink::SinkExt;
 use futures_util::stream::Stream;
@@ -26,6 +25,8 @@ use rustyknife::types::DomainPart;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::future::ready;
+use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -36,7 +37,6 @@ use tokio_util::codec::Framed;
 use tokio_util::codec::FramedParts;
 
 pub type EhloKeywords = BTreeMap<String, Option<String>>;
-pub type ShutdownSignal = dyn FusedFuture<Output = Result<(), ()>> + Send + Unpin;
 
 pub trait Handler: Send {
     type TlsConfig;
@@ -67,20 +67,17 @@ pub trait Handler: Send {
     fn data_start(&mut self) -> impl Send + Future<Output = Option<Reply>> {
         async { None }
     }
-    fn data<S>(
-        &mut self,
-        stream: &mut S,
-    ) -> impl Send + Future<Output = Result<Option<Reply>, ServerError>>
+    fn data<S>(&mut self, stream: S) -> impl Send + Future<Output = Result<Option<Reply>, Error>>
     where
-        S: Stream<Item = Result<BytesMut, LineError>> + Unpin + Send;
+        S: Stream<Item = Result<BytesMut, LineError>> + Send;
     fn bdat<S>(
         &mut self,
-        stream: &mut S,
+        stream: S,
         size: u64,
         last: bool,
-    ) -> impl Send + Future<Output = Result<Option<Reply>, ServerError>>
+    ) -> impl Send + Future<Output = Result<Option<Reply>, Error>>
     where
-        S: Stream<Item = Result<BytesMut, LineError>> + Unpin + Send;
+        S: Stream<Item = Result<BytesMut, LineError>> + Send;
 
     fn unhandled_command(
         &mut self,
@@ -106,34 +103,35 @@ impl Default for Config {
     }
 }
 
-pub async fn smtp_server<S, H>(
-    socket: &mut S,
+pub async fn smtp_server<S, H, Shutdown: Future>(
+    socket: S,
     handler: &mut H,
     config: &Config,
-    shutdown: &mut ShutdownSignal,
+    shutdown: Shutdown,
     banner: bool,
-) -> Result<LoopExit<H>, ServerError>
+) -> Result<LoopExit<H, Shutdown::Output>, Error>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    S: AsyncRead + AsyncWrite + Send,
     H: Handler,
 {
-    let terminated = shutdown.is_terminated();
+    let shutdown = pin!(shutdown);
     let mut server = InnerServer {
         handler,
         config,
         state: State::Initial,
-        shutdown,
-        shutdown_on_idle: terminated,
+        shutdown: Ok(shutdown),
     };
 
-    let res = server.serve(socket, banner).await;
+    let mut socket = pin!(socket);
+    let res = server.serve(socket.as_mut(), banner).await;
     socket.flush().await?;
     res
 }
 
-pub enum LoopExit<H: Handler> {
+pub enum LoopExit<H: Handler, T> {
     Done,
-    STARTTLS(H::TlsConfig),
+    Shutdown(T),
+    StartTls(H::TlsConfig),
 }
 
 #[derive(Debug, PartialEq)]
@@ -145,98 +143,106 @@ enum State {
     Bdatfail,
 }
 
-struct InnerServer<'a, H> {
+struct InnerServer<'a, H, Shutdown: Future> {
     handler: &'a mut H,
     config: &'a Config,
     state: State,
-    shutdown: &'a mut ShutdownSignal,
-    shutdown_on_idle: bool,
+    shutdown: Result<Pin<&'a mut Shutdown>, Option<Shutdown::Output>>,
 }
 
-impl<'a, H> InnerServer<'a, H>
-where
-    H: Handler,
-{
+impl<'a, H: Handler, Shutdown: Future> InnerServer<'a, H, Shutdown> {
     async fn serve<S>(
         &mut self,
-        base_socket: &mut S,
+        base_socket: Pin<&mut S>,
         banner: bool,
-    ) -> Result<LoopExit<H>, ServerError>
+    ) -> Result<LoopExit<H, Shutdown::Output>, Error>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
+        S: AsyncRead + AsyncWrite + Send,
     {
         let mut socket = Framed::new(base_socket, LineCodec::default());
 
         if banner {
             socket
-                .send(Reply::new(220, None, "localhost ESMTP smtpbis 0.1.0"))
+                .send(Reply::new_static(
+                    220,
+                    None,
+                    "localhost ESMTP smtpbis 0.1.0",
+                ))
                 .await?;
         }
 
         loop {
             let cmd = match self.read_command(&mut socket).await {
                 Ok(cmd) => cmd,
-                Err(ServerError::SyntaxError(_)) => {
+                Err(ReadCommandError::Syntax) => {
                     socket.send(Reply::syntax_error()).await?;
                     continue;
                 }
-                Err(ServerError::Shutdown) => {
-                    socket.send(Reply::new(421, None, "Shutting down")).await?;
-                    return Ok(LoopExit::Done);
+                Err(ReadCommandError::Shutdown(val)) => {
+                    socket
+                        .send(Reply::new_static(421, None, "Shutting down"))
+                        .await?;
+                    return Ok(LoopExit::Shutdown(val));
                 }
-                Err(e) => return Err(e),
+                Err(ReadCommandError::Fatal(e)) => return Err(e),
             };
 
             match self.dispatch_command(&mut socket, cmd).await? {
-                Some(LoopExit::STARTTLS(tls_config)) => {
+                Some(LoopExit::StartTls(tls_config)) => {
                     socket.flush().await?;
-                    let FramedParts { io, read_buf, .. } = socket.into_parts();
+                    let FramedParts {
+                        mut io, read_buf, ..
+                    } = socket.into_parts();
                     // Absolutely do not allow pipelining past a
                     // STARTTLS command.
                     if !read_buf.is_empty() {
-                        return Err(ServerError::Pipelining);
+                        return Err(Error::Pipelining);
                     }
-                    let tls_reply = Reply::new(220, None, "starting TLS").to_string();
 
-                    io.write_all(tls_reply.as_bytes()).await?;
-                    return Ok(LoopExit::STARTTLS(tls_config));
+                    let mut tls_reply = BytesMut::new();
+                    Reply::new_static(220, None, "starting TLS").write_to(&mut tls_reply);
+                    io.write_all(&tls_reply).await?;
+
+                    return Ok(LoopExit::StartTls(tls_config));
                 }
-                Some(LoopExit::Done) => {
-                    return Ok(LoopExit::Done);
-                }
+                Some(other) => return Ok(other),
                 None => {}
             }
         }
     }
 
-    fn shutdown_check(&self) -> Result<(), ServerError> {
-        match (self.shutdown_on_idle, &self.state) {
-            (true, State::Initial) | (true, State::Bdatfail) => Err(ServerError::Shutdown),
-            _ => Ok(()),
+    fn shutdown_check(&mut self) -> Result<(), ReadCommandError<Shutdown::Output>> {
+        if matches!(self.state, State::Initial | State::Bdatfail) {
+            if let Err(shutdown) = &mut self.shutdown {
+                return Err(ReadCommandError::Shutdown(shutdown.take().unwrap()));
+            }
         }
+        Ok(())
     }
 
-    async fn read_command<S>(&mut self, reader: &mut S) -> Result<Command, ServerError>
+    async fn read_command<S>(
+        &mut self,
+        reader: &mut S,
+    ) -> Result<Command, ReadCommandError<Shutdown::Output>>
     where
         S: Stream<Item = Result<BytesMut, LineError>> + Unpin,
         S: Sink<Reply>,
-        ServerError: From<<S as Sink<Reply>>::Error>,
+        ReadCommandError<Shutdown::Output>: From<<S as Sink<Reply>>::Error>,
     {
         self.shutdown_check()?;
 
-        let line = if self.shutdown.is_terminated() {
-            reader.next().await
-        } else {
-            match select(reader.next(), &mut self.shutdown).await {
+        let line = match &mut self.shutdown {
+            Ok(shutdown) => match select(reader.next(), shutdown.as_mut()).await {
                 Either::Left((cmd, _)) => cmd,
-                Either::Right((_, cmd_fut)) => {
-                    self.shutdown_on_idle = true;
+                Either::Right((val, cmd_fut)) => {
+                    self.shutdown = Err(Some(val));
                     self.shutdown_check()?;
                     cmd_fut.await
                 }
-            }
+            },
+            Err(_) => reader.next().await,
         }
-        .ok_or(ServerError::EOF)??;
+        .ok_or(Error::Eof)??;
 
         let parse_res = if self.config.enable_smtputf8 {
             command::<Intl>(&line)
@@ -245,19 +251,19 @@ where
         };
 
         match parse_res {
-            Err(_) => Err(ServerError::SyntaxError(line)),
-            Ok((rem, _)) if !rem.is_empty() => Err(ServerError::SyntaxError(line)),
+            Err(_) => Err(ReadCommandError::Syntax),
+            Ok((rem, _)) if !rem.is_empty() => Err(ReadCommandError::Syntax),
             Ok((_, cmd)) => Ok(cmd),
         }
     }
 
     async fn dispatch_command<S>(
         &mut self,
-        socket: &mut Framed<&mut S, LineCodec>,
+        socket: &mut Framed<Pin<&mut S>, LineCodec>,
         command: Command,
-    ) -> Result<Option<LoopExit<H>>, ServerError>
+    ) -> Result<Option<LoopExit<H, Shutdown::Output>>, Error>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send,
+        S: AsyncRead + AsyncWrite + Send,
     {
         match command {
             Base(EHLO(domain)) => {
@@ -277,7 +283,7 @@ where
                 socket.send(reply).await?;
             }
             Base(QUIT) => {
-                socket.send(Reply::new(221, None, "bye")).await?;
+                socket.send(Reply::new_static(221, None, "bye")).await?;
                 return Ok(Some(LoopExit::Done));
             }
             Base(RSET) => {
@@ -287,7 +293,7 @@ where
             }
             Ext(crate::Ext::StartTls) if self.config.enable_starttls => {
                 if let Some(tls_config) = self.handler.tls_request().await {
-                    return Ok(Some(LoopExit::STARTTLS(tls_config)));
+                    return Ok(Some(LoopExit::StartTls(tls_config)));
                 } else {
                     socket.send(Reply::not_implemented()).await?;
                 }
@@ -308,7 +314,7 @@ where
         Ok(None)
     }
 
-    async fn do_ehlo(&mut self, domain: DomainPart) -> Result<Reply, ServerError> {
+    async fn do_ehlo(&mut self, domain: DomainPart) -> Result<Reply, Error> {
         let mut initial_keywords = EhloKeywords::new();
         for kw in ["PIPELINING", "ENHANCEDSTATUSCODES"].as_ref() {
             initial_keywords.insert((*kw).into(), None);
@@ -337,12 +343,12 @@ where
                     }
                 }
                 self.state = State::Initial;
-                Ok(Reply::new(250, None, reply_text))
+                Ok(Reply::new_checked(250, None, reply_text).unwrap())
             }
         }
     }
 
-    async fn do_helo(&mut self, domain: Domain) -> Result<Reply, ServerError> {
+    async fn do_helo(&mut self, domain: Domain) -> Result<Reply, Error> {
         Ok(
             match self.handler.helo(domain).await.with_default(Reply::ok()) {
                 Ok(reply) => {
@@ -354,11 +360,7 @@ where
         )
     }
 
-    async fn do_mail(
-        &mut self,
-        path: ReversePath,
-        params: Vec<Param>,
-    ) -> Result<Reply, ServerError> {
+    async fn do_mail(&mut self, path: ReversePath, params: Vec<Param>) -> Result<Reply, Error> {
         Ok(match self.state {
             State::Initial => match self
                 .handler
@@ -376,11 +378,7 @@ where
         })
     }
 
-    async fn do_rcpt(
-        &mut self,
-        path: ForwardPath,
-        params: Vec<Param>,
-    ) -> Result<Reply, ServerError> {
+    async fn do_rcpt(&mut self, path: ForwardPath, params: Vec<Param>) -> Result<Reply, Error> {
         Ok(match self.state {
             State::Mail | State::Rcpt => match self
                 .handler
@@ -398,11 +396,11 @@ where
         })
     }
 
-    async fn do_data<S>(&mut self, socket: &mut S) -> Result<Reply, ServerError>
+    async fn do_data<S>(&mut self, socket: &mut S) -> Result<Reply, Error>
     where
         S: Stream<Item = Result<BytesMut, LineError>> + Unpin + Send,
         S: Sink<Reply>,
-        ServerError: From<<S as Sink<Reply>>::Error>,
+        Error: From<<S as Sink<Reply>>::Error>,
     {
         Ok(match self.state {
             State::Rcpt => match self
@@ -430,7 +428,7 @@ where
 
                         socket.send(reply).await?;
 
-                        return Err(ServerError::DataAbort);
+                        return Err(Error::DataAbort);
                     }
 
                     self.state = State::Initial;
@@ -441,7 +439,7 @@ where
             State::Initial => Reply::no_mail_transaction(),
             State::Mail => Reply::no_valid_recipients(),
             State::Bdat | State::Bdatfail => {
-                Reply::new(503, None, "BDAT may not be mixed with DATA")
+                Reply::new_static(503, None, "BDAT may not be mixed with DATA")
             }
         })
     }
@@ -451,7 +449,7 @@ where
         socket: &mut Framed<S, LineCodec>,
         chunk_size: u64,
         last: bool,
-    ) -> Result<Reply, ServerError>
+    ) -> Result<Reply, Error>
     where
         Framed<S, LineCodec>: Stream<Item = Result<BytesMut, LineError>>
             + Sink<Reply, Error = LineError>
@@ -478,7 +476,7 @@ where
 
                     socket.send(reply).await?;
 
-                    return Err(ServerError::DataAbort);
+                    return Err(Error::DataAbort);
                 }
 
                 match reply.with_default(Reply::ok()) {
@@ -503,28 +501,45 @@ where
 }
 
 #[derive(Debug)]
-pub enum ServerError {
-    EOF,
+pub enum Error {
+    Eof,
     Framing(LineError),
-    SyntaxError(BytesMut),
-    IO(std::io::Error),
+    Io(std::io::Error),
     Pipelining,
     DataAbort,
-    Shutdown,
 }
 
-impl From<LineError> for ServerError {
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<LineError> for Error {
     fn from(source: LineError) -> Self {
         match source {
-            LineError::Io(e) => Self::IO(e),
+            LineError::Io(e) => Self::Io(e),
             _ => Self::Framing(source),
         }
     }
 }
 
-impl From<std::io::Error> for ServerError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IO(err)
+#[derive(Debug)]
+enum ReadCommandError<T> {
+    Fatal(Error),
+    Syntax,
+    Shutdown(T),
+}
+
+impl<T> From<Error> for ReadCommandError<T> {
+    fn from(e: Error) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+impl<T> From<LineError> for ReadCommandError<T> {
+    fn from(e: LineError) -> Self {
+        Self::Fatal(Error::Framing(e))
     }
 }
 

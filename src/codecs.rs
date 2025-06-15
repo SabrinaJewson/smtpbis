@@ -3,7 +3,6 @@ use bytes::BytesMut;
 use std::convert::TryInto;
 use std::error::Error;
 use std::fmt::Display;
-use std::fmt::Write;
 use tokio_util::codec::Decoder;
 use tokio_util::codec::Encoder;
 
@@ -135,7 +134,7 @@ impl Encoder<Reply> for LineCodec {
     type Error = LineError;
 
     fn encode(&mut self, reply: Reply, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        write!(buf, "{}", reply).unwrap();
+        reply.write_to(buf);
         Ok(())
     }
 }

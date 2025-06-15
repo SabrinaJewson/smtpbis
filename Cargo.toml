@@ -16,3 +16,4 @@ tokio = {version="1.45.1", features=["io-util"]}
 tokio-util = {version="0.7.15", features=["codec"]}
 bytes = "1.10.1"
 futures-util = { version = "0.3.31", features = ["sink"] }
+itoa = "1.0.15"
