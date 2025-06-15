@@ -7,6 +7,7 @@ use crate::Reply;
 use crate::command;
 use crate::reply::ReplyDefault;
 use bytes::Buf;
+use bytes::Bytes;
 use bytes::BytesMut;
 use futures_util::Sink;
 use futures_util::future::Either;
@@ -108,7 +109,7 @@ pub async fn smtp_server<S, H, Shutdown: Future>(
     handler: &mut H,
     config: &Config,
     shutdown: Shutdown,
-    banner: bool,
+    banner: Option<Bytes>,
 ) -> Result<LoopExit<H, Shutdown::Output>, Error>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -154,20 +155,16 @@ impl<'a, H: Handler, Shutdown: Future> InnerServer<'a, H, Shutdown> {
     async fn serve<S>(
         &mut self,
         base_socket: Pin<&mut S>,
-        banner: bool,
+        banner: Option<Bytes>,
     ) -> Result<LoopExit<H, Shutdown::Output>, Error>
     where
         S: AsyncRead + AsyncWrite + Send,
     {
         let mut socket = Framed::new(base_socket, LineCodec::default());
 
-        if banner {
+        if let Some(banner) = banner {
             socket
-                .send(Reply::new_static(
-                    220,
-                    None,
-                    "localhost ESMTP smtpbis 0.1.0",
-                ))
+                .send(Reply::new_checked(220, None, banner).expect("banner should be valid"))
                 .await?;
         }
 
