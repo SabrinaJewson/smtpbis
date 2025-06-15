@@ -2,7 +2,7 @@
 name = "smtpbis"
 version = "0.1.8"
 authors = ["Jonathan Bastien-Filiatrault <jonathan@zerospam.ca>"]
-edition = "2018"
+edition = "2024"
 description = "Asynchronous ESMTP service library."
 license = "GPL-3.0+"
 categories = ["email", "network-programming"]
@@ -16,4 +16,3 @@ tokio = {version="1.45.1", features=["io-util"]}
 tokio-util = {version="0.7.15", features=["codec"]}
 bytes = "1.10.1"
 futures-util = { version = "0.3.31", features = ["sink"] }
-async-trait = "0.1.88"

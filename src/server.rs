@@ -1,21 +1,20 @@
-use crate::command;
-use crate::reply::ReplyDefault;
 use crate::Command;
 use crate::Command::Base;
 use crate::Command::*;
 use crate::LineCodec;
 use crate::LineError;
 use crate::Reply;
-use async_trait::async_trait;
+use crate::command;
+use crate::reply::ReplyDefault;
 use bytes::Buf;
 use bytes::BytesMut;
-use futures_util::future::select;
+use futures_util::Sink;
 use futures_util::future::Either;
 use futures_util::future::FusedFuture;
+use futures_util::future::select;
 use futures_util::sink::SinkExt;
 use futures_util::stream::Stream;
 use futures_util::stream::StreamExt;
-use futures_util::Sink;
 use rustyknife::behaviour::Intl;
 use rustyknife::behaviour::Legacy;
 use rustyknife::rfc5321::Command::*;
@@ -27,9 +26,9 @@ use rustyknife::types::DomainPart;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::future::ready;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -39,42 +38,55 @@ use tokio_util::codec::FramedParts;
 pub type EhloKeywords = BTreeMap<String, Option<String>>;
 pub type ShutdownSignal = dyn FusedFuture<Output = Result<(), ()>> + Send + Unpin;
 
-#[async_trait]
 pub trait Handler: Send {
     type TlsConfig;
 
-    async fn tls_request(&mut self) -> Option<Self::TlsConfig> {
-        None
+    fn tls_request(&mut self) -> impl Send + Future<Output = Option<Self::TlsConfig>> {
+        async { None }
     }
 
-    async fn ehlo(
+    fn ehlo(
         &mut self,
         domain: DomainPart,
         initial_keywords: EhloKeywords,
-    ) -> Result<(String, EhloKeywords), Reply>;
-    async fn helo(&mut self, domain: Domain) -> Option<Reply>;
-    async fn rset(&mut self);
+    ) -> impl Send + Future<Output = Result<(String, EhloKeywords), Reply>>;
+    fn helo(&mut self, domain: Domain) -> impl Send + Future<Output = Option<Reply>>;
+    fn rset(&mut self) -> impl Send + Future<Output = ()>;
 
-    async fn mail(&mut self, path: ReversePath, params: Vec<Param>) -> Option<Reply>;
-    async fn rcpt(&mut self, path: ForwardPath, params: Vec<Param>) -> Option<Reply>;
+    fn mail(
+        &mut self,
+        path: ReversePath,
+        params: Vec<Param>,
+    ) -> impl Send + Future<Output = Option<Reply>>;
+    fn rcpt(
+        &mut self,
+        path: ForwardPath,
+        params: Vec<Param>,
+    ) -> impl Send + Future<Output = Option<Reply>>;
 
-    async fn data_start(&mut self) -> Option<Reply> {
-        None
+    fn data_start(&mut self) -> impl Send + Future<Output = Option<Reply>> {
+        async { None }
     }
-    async fn data<S>(&mut self, stream: &mut S) -> Result<Option<Reply>, ServerError>
+    fn data<S>(
+        &mut self,
+        stream: &mut S,
+    ) -> impl Send + Future<Output = Result<Option<Reply>, ServerError>>
     where
         S: Stream<Item = Result<BytesMut, LineError>> + Unpin + Send;
-    async fn bdat<S>(
+    fn bdat<S>(
         &mut self,
         stream: &mut S,
         size: u64,
         last: bool,
-    ) -> Result<Option<Reply>, ServerError>
+    ) -> impl Send + Future<Output = Result<Option<Reply>, ServerError>>
     where
         S: Stream<Item = Result<BytesMut, LineError>> + Unpin + Send;
 
-    async fn unhandled_command(&mut self, _command: Command) -> Option<Reply> {
-        None
+    fn unhandled_command(
+        &mut self,
+        _command: Command,
+    ) -> impl Send + Future<Output = Option<Reply>> {
+        async { None }
     }
 }
 

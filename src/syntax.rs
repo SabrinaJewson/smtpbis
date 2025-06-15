@@ -1,13 +1,13 @@
+use rustyknife::NomResult;
 use rustyknife::nom::branch::alt;
 use rustyknife::nom::combinator::map;
+use rustyknife::rfc5321::Command as BaseCommand;
+use rustyknife::rfc5321::UTF8Policy;
 use rustyknife::rfc5321::bdat_command;
 use rustyknife::rfc5321::command as base_command;
 use rustyknife::rfc5321::starttls_command;
-use rustyknife::rfc5321::Command as BaseCommand;
-use rustyknife::rfc5321::UTF8Policy;
-use rustyknife::xforward::command as xforward_command;
 use rustyknife::xforward::Param as XforwardParam;
-use rustyknife::NomResult;
+use rustyknife::xforward::command as xforward_command;
 
 #[derive(Debug)]
 pub enum Command {
