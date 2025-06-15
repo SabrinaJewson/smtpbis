@@ -5,7 +5,6 @@ use crate::Reply;
 use crate::command;
 use crate::reply::ReplyDefault;
 use bytes::Buf;
-use bytes::Bytes;
 use bytes::BytesMut;
 use futures_util::Sink;
 use futures_util::future::Either;
@@ -23,7 +22,6 @@ use rustyknife::rfc5321::ReversePath;
 use rustyknife::types::Domain;
 use rustyknife::types::DomainPart;
 use std::collections::BTreeMap;
-use std::fmt::Write;
 use std::pin::Pin;
 use std::pin::pin;
 use std::task::Poll;
@@ -101,12 +99,28 @@ impl Default for Config {
     }
 }
 
+pub struct Banner(Reply);
+
+impl Banner {
+    pub fn new(domain: &str, extra: &str) -> Self {
+        // TODO: Verify that `domain` is a valid `DomainPart`
+        let mut text = BytesMut::new();
+        text.extend_from_slice(domain.as_bytes());
+        text.extend_from_slice(b" ESMTP");
+        if !extra.is_empty() {
+            text.extend_from_slice(b" ");
+            text.extend_from_slice(extra.as_bytes());
+        }
+        Self(Reply::new_checked(220, None, text).unwrap())
+    }
+}
+
 pub async fn smtp_server<S, H, Shutdown: Future>(
     socket: S,
     handler: &mut H,
     config: &Config,
     shutdown: Shutdown,
-    banner: Option<Bytes>,
+    banner: Option<&Banner>,
 ) -> Result<LoopExit<H, Shutdown::Output>, Error>
 where
     S: AsyncRead + AsyncWrite + Send,
@@ -152,7 +166,7 @@ impl<'a, H: Handler, Shutdown: Future> InnerServer<'a, H, Shutdown> {
     async fn serve<S>(
         &mut self,
         base_socket: Pin<&mut S>,
-        banner: Option<Bytes>,
+        banner: Option<&Banner>,
     ) -> Result<LoopExit<H, Shutdown::Output>, Error>
     where
         S: AsyncRead + AsyncWrite + Send,
@@ -160,9 +174,7 @@ impl<'a, H: Handler, Shutdown: Future> InnerServer<'a, H, Shutdown> {
         let mut socket = Framed::new(base_socket, LineCodec::default());
 
         if let Some(banner) = banner {
-            socket
-                .send(Reply::new_checked(220, None, banner).expect("banner should be valid"))
-                .await?;
+            socket.send(banner.0.clone()).await?;
         }
 
         loop {
@@ -328,13 +340,16 @@ impl<'a, H: Handler, Shutdown: Future> InnerServer<'a, H, Shutdown> {
             Err(reply) => Ok(reply),
             Ok((greeting, keywords)) => {
                 assert!(!greeting.contains('\r') && !greeting.contains('\n'));
-                let mut reply_text = format!("{}\n", greeting);
+                let mut reply_text = greeting;
+                reply_text.push('\n');
 
                 for (kw, value) in keywords {
-                    match value {
-                        Some(value) => writeln!(reply_text, "{} {}", kw, value).unwrap(),
-                        None => writeln!(reply_text, "{}", kw).unwrap(),
+                    reply_text.push_str(&kw);
+                    if let Some(value) = value {
+                        reply_text.push(' ');
+                        reply_text.push_str(&value);
                     }
+                    reply_text.push('\n');
                 }
                 self.state = State::Initial;
                 Ok(Reply::new_checked(250, None, reply_text).unwrap())

@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use bytes::BytesMut;
 
+#[derive(Clone)]
 pub struct Reply {
     code: u16,
     ecode: Option<EnhancedCode>,
