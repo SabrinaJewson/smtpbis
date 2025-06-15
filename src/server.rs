@@ -1,7 +1,4 @@
 use crate::Command;
-use crate::Command::Base;
-use std::task::ready;
-use crate::Command::*;
 use crate::LineCodec;
 use crate::LineError;
 use crate::Reply;
@@ -14,6 +11,7 @@ use futures_util::Sink;
 use futures_util::future::Either;
 use futures_util::future::select;
 use futures_util::sink::SinkExt;
+use futures_util::stream;
 use futures_util::stream::Stream;
 use futures_util::stream::StreamExt;
 use rustyknife::behaviour::Intl;
@@ -28,13 +26,13 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::pin::Pin;
 use std::pin::pin;
+use std::task::Poll;
+use std::task::ready;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::Framed;
 use tokio_util::codec::FramedParts;
-use futures_util::stream;
-use std::task::Poll;
 
 pub type EhloKeywords = BTreeMap<String, Option<String>>;
 
@@ -262,39 +260,39 @@ impl<'a, H: Handler, Shutdown: Future> InnerServer<'a, H, Shutdown> {
         S: AsyncRead + AsyncWrite + Send,
     {
         match command {
-            Base(EHLO(domain)) => {
+            Command::Base(EHLO(domain)) => {
                 socket.send(self.do_ehlo(domain).await?).await?;
             }
-            Base(HELO(domain)) => {
+            Command::Base(HELO(domain)) => {
                 socket.send(self.do_helo(domain).await?).await?;
             }
-            Base(MAIL(path, params)) => {
+            Command::Base(MAIL(path, params)) => {
                 socket.send(self.do_mail(path, params).await?).await?;
             }
-            Base(RCPT(path, params)) => {
+            Command::Base(RCPT(path, params)) => {
                 socket.send(self.do_rcpt(path, params).await?).await?;
             }
-            Base(DATA) => {
+            Command::Base(DATA) => {
                 let reply = self.do_data(socket).await?;
                 socket.send(reply).await?;
             }
-            Base(QUIT) => {
+            Command::Base(QUIT) => {
                 socket.send(Reply::new_static(221, None, "bye")).await?;
                 return Ok(Some(LoopExit::Done));
             }
-            Base(RSET) => {
+            Command::Base(RSET) => {
                 self.state = State::Initial;
                 self.handler.rset().await;
                 socket.send(Reply::ok()).await?;
             }
-            Ext(crate::Ext::StartTls) if self.config.enable_starttls => {
+            Command::Ext(crate::Ext::StartTls) if self.config.enable_starttls => {
                 if let Some(tls_config) = self.handler.tls_request().await {
                     return Ok(Some(LoopExit::StartTls(tls_config)));
                 } else {
                     socket.send(Reply::not_implemented()).await?;
                 }
             }
-            Ext(crate::Ext::Bdat(size, last)) if self.config.enable_chunking => {
+            Command::Ext(crate::Ext::Bdat(size, last)) if self.config.enable_chunking => {
                 let reply = self.do_bdat(socket, size, last).await?;
                 socket.send(reply).await?;
             }
@@ -559,7 +557,7 @@ where
                     line.advance(1);
                 }
                 Some(Ok(line))
-            },
+            }
             Some(Err(e)) => Some(Err(e)),
         })
     })
