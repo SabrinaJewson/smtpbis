@@ -1,5 +1,6 @@
 use crate::Command;
 use crate::Command::Base;
+use std::task::ready;
 use crate::Command::*;
 use crate::LineCodec;
 use crate::LineError;
@@ -25,17 +26,15 @@ use rustyknife::types::Domain;
 use rustyknife::types::DomainPart;
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::future::ready;
 use std::pin::Pin;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::Framed;
 use tokio_util::codec::FramedParts;
+use futures_util::stream;
+use std::task::Poll;
 
 pub type EhloKeywords = BTreeMap<String, Option<String>>;
 
@@ -544,36 +543,26 @@ fn read_body_data<S>(source: &mut S) -> impl Stream<Item = Result<BytesMut, Line
 where
     S: Stream<Item = Result<BytesMut, LineError>> + Unpin,
 {
-    let gen_abort = Arc::new(AtomicBool::new(true));
-    let gen_abort2 = gen_abort.clone();
-
-    let abort = futures_util::stream::once(ready(Err(LineError::DataAbort)))
-        .filter(move |_| ready(gen_abort.load(Ordering::SeqCst)));
-
-    source
-        .take_while(move |res| {
-            ready(
-                res.as_ref()
-                    .map(|line| {
-                        if line.as_ref() == b".\r\n" {
-                            gen_abort2.store(false, Ordering::SeqCst);
-                            false
-                        } else {
-                            true
-                        }
-                    })
-                    .unwrap_or(true),
-            )
-        })
-        .map(|res| {
-            res.map(|mut line| {
+    let mut done = false;
+    stream::poll_fn(move |cx| {
+        if done {
+            return Poll::Ready(None);
+        }
+        Poll::Ready(match ready!(source.poll_next_unpin(cx)) {
+            None => {
+                done = true;
+                Some(Err(LineError::DataAbort))
+            }
+            Some(Ok(line)) if line.as_ref() == b".\r\n" => None,
+            Some(Ok(mut line)) => {
                 if line.starts_with(b".") {
                     line.advance(1);
                 }
-                line
-            })
+                Some(Ok(line))
+            },
+            Some(Err(e)) => Some(Err(e)),
         })
-        .chain(abort)
+    })
 }
 
 fn read_body_bdat<S>(
@@ -583,25 +572,20 @@ fn read_body_bdat<S>(
 where
     Framed<S, LineCodec>: Stream<Item = Result<BytesMut, LineError>> + Unpin,
 {
-    let gen_abort = Arc::new(AtomicBool::new(true));
-    let gen_abort2 = gen_abort.clone();
-
-    let abort = futures_util::stream::once(ready(Err(LineError::DataAbort)))
-        .filter(move |_| ready(gen_abort.load(Ordering::SeqCst)));
-
     socket.codec_mut().chunking_mode(size);
 
-    socket
-        .take_while(move |chunk| {
-            let more = match chunk {
-                Err(LineError::ChunkingDone) => {
-                    gen_abort2.store(false, Ordering::SeqCst);
-                    false
-                }
-                _ => true,
-            };
-
-            ready(more)
+    let mut done = false;
+    stream::poll_fn(move |cx| {
+        if done {
+            return Poll::Ready(None);
+        }
+        Poll::Ready(match ready!(socket.poll_next_unpin(cx)) {
+            None => {
+                done = true;
+                Some(Err(LineError::DataAbort))
+            }
+            Some(Err(LineError::ChunkingDone)) => None,
+            Some(res) => Some(res),
         })
-        .chain(abort)
+    })
 }

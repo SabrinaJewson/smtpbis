@@ -1,8 +1,6 @@
 use crate::Reply;
 use bytes::BytesMut;
 use std::convert::TryInto;
-use std::error::Error;
-use std::fmt::Display;
 use tokio_util::codec::Decoder;
 use tokio_util::codec::Encoder;
 
@@ -142,13 +140,5 @@ impl Encoder<Reply> for LineCodec {
 impl From<std::io::Error> for LineError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err)
-    }
-}
-
-impl Error for LineError {}
-
-impl Display for LineError {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        write!(fmt, "{:?}", self)
     }
 }
